@@ -2,3 +2,5 @@ torch>=2.4,<3
 transformers>=4.45,<5
 Pillow>=10,<12
 datasets>=2.20,<4
+mcp>=1.0,<2
+pytest>=8,<9

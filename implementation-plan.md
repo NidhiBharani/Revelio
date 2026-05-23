@@ -85,7 +85,9 @@ Phase 5's startup check calls `list_tools` over the MCP client with a 2-second t
 `AI_CONFIDENCE_THRESHOLD` is not used in the MVP. Behavior (e.g. "reply *Unclear* when confidence < threshold") is unresolved, and shipping unused config invites bugs. Omit from `.env` entirely until there's a real product reason to add it. Note in README as future work.
 
 ### 10. Concurrency
-Single-flight detection is fine for a small group. The detector singleton holds the model on MPS; concurrent `detect()` calls share it via an `asyncio.Lock` in `detector.py` so two near-simultaneous photos queue instead of double-allocating GPU memory. If group volume grows, swap to a worker pool — not now.
+Single-flight detection is fine for a small group. The detector singleton holds the model on MPS; concurrent `detect()` calls share it via a lock in `detector.py` so two near-simultaneous photos queue instead of double-allocating GPU memory. If group volume grows, swap to a worker pool — not now.
+
+> **Implementation note (Phase 2 shipped):** uses `threading.Lock`, not `asyncio.Lock`. `detect()` is sync and runs blocking inference; `asyncio.Lock` can only be acquired from inside a running event loop. `threading.Lock` composes with both sync callers (tests, CLI) and async callers (Phase 3 MCP server, Phase 4 bot — which should dispatch inference via `asyncio.to_thread`). Documented in the `detector.py` module docstring.
 
 ---
 
@@ -134,7 +136,7 @@ Single-flight detection is fine for a small group. The detector singleton holds 
 4. Create `detectors/__init__.py` — re-export `get_detector`, `BaseDetector`, `DetectionResult`.
 5. Create `detector.py` (public façade):
    - At **import time**: call `get_detector()` and bind the singleton — this validates `DETECTOR_MODEL` eagerly so an unknown name raises `ValueError` at startup, not on the first photo. (Model weight loading still happens here; that's the cost of eager startup. Acceptable: the bot needs the model loaded before it can serve anyway.)
-   - `detect(image_path: str) -> dict` delegates to the singleton, guarded by an `asyncio.Lock` so concurrent calls queue rather than double-using the model. Returns `{"verdict": ..., "confidence": float, "summary": str}`.
+   - `detect(image_path: str) -> dict` delegates to the singleton, guarded by a lock so concurrent calls queue rather than double-using the model. Returns `{"verdict": ..., "confidence": float, "summary": str}`. (See Key Decision 10: `threading.Lock`, not `asyncio.Lock`.)
 6. Update `test_detector.py` to `from detector import detect` and loop over all 6 test images, asserting verdicts.
 
 **Done when:** `python test_detector.py` runs the full battery and reports pass/fail. Model loads exactly once across all 6 calls (add a print-on-load to verify). Setting `DETECTOR_MODEL=bogus` and importing `detector` raises `ValueError` immediately — before any `detect()` call.
@@ -146,14 +148,15 @@ Single-flight detection is fine for a small group. The detector singleton holds 
 **Files:** `mcp_server/server.py`, `test_mcp_client.py`
 
 **Steps:**
-1. Add `mcp>=1.0` to `requirements.txt`.
-2. In `server.py`, use the MCP SDK's **streamable HTTP transport** (not stdio).
+1. Add `mcp>=1.0` to `requirements.txt`. (Shipped against `mcp 1.27.1`.)
+2. In `server.py`, use the MCP SDK's **streamable HTTP transport** (not stdio). Concretely: `mcp.server.fastmcp.FastMCP(...)` with `mcp.run(transport="streamable-http")`. Client side: `mcp.client.streamable_http.streamablehttp_client` + `mcp.ClientSession`.
 3. Register one tool `detect_ai_image(image_path: str)`:
    - Body calls `detector.detect(image_path)`.
    - Wrap in try/except — any exception returns `{"error": str(e), "verdict": None, "confidence": None}`.
    - Catch `FileNotFoundError` and `PIL.UnidentifiedImageError` distinctly so the bot can produce the right user-facing message (see Phase 4 error matrix).
-4. Bind to `127.0.0.1:8765` (loopback only — never `0.0.0.0`; the tool takes a local file path and would be an arbitrary-file-read primitive if exposed). Mount the streamable HTTP transport at `/mcp`. Log each invocation: timestamp, image path, verdict, latency.
-5. Write `test_mcp_client.py` using the SDK's HTTP client. Connect to `http://127.0.0.1:8765/mcp`, call the tool against one AI and one real image, print results.
+   - **Implementation detail (shipped):** the detector raises `ValueError(...) from UnidentifiedImageError(...)` — the server inspects `exc.__cause__` and prepends the originating type name to the `error` field (e.g. `"UnidentifiedImageError: cannot identify image file ..."`). The Phase 4 error matrix's string-match on the type name is what makes this work; if you change the envelope format, update Phase 4's bot routing in lockstep.
+4. Bind to `127.0.0.1:8765` (loopback only — never `0.0.0.0`; the tool takes a local file path and would be an arbitrary-file-read primitive if exposed). Mount the streamable HTTP transport at `/mcp` (FastMCP's `streamable_http_path` default — leave explicit for clarity). Log each invocation: timestamp, image path, verdict, latency.
+5. Write `test_mcp_client.py` using the SDK's HTTP client. Connect to `http://127.0.0.1:8765/mcp`, call the tool against one AI and one real image, print results. (Shipped version also exercises both error paths — missing file and non-image file — to verify the Phase 4 routing assumption end-to-end.)
 6. Document the run command at the top of `server.py`: `python -m mcp_server.server`.
 
 **Done when:** Two terminals — one runs the server, the other runs the test client; correct verdicts come back. Killing the client doesn't kill the server.

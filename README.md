@@ -4,13 +4,13 @@ A Telegram bot that detects AI-generated images posted in group chats and replie
 
 ## Status
 
-**Phase 1 of 6 complete** — local model inference is working. The Telegram bot, MCP server, and hardening phases are not implemented yet. See [Roadmap](#roadmap).
+**Phase 3 of 6 complete** — local model inference is working, the detector backend is swappable, and the detector is now exposed over an MCP HTTP server. The Telegram bot and hardening phases are not implemented yet. See [Roadmap](#roadmap).
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | Local model inference (CLI) | Done |
-| 2 | Detector module (swappable backend) | Not started |
-| 3 | MCP server (HTTP transport) | Not started |
+| 2 | Detector module (swappable backend) | Done |
+| 3 | MCP server (HTTP transport) | Done |
 | 4 | Telegram bot (polling) — first end-to-end MVP | Not started |
 | 5 | Hardening + README polish | Not started |
 | 6 | Webhook mode (deferred until deployed) | Not started |
@@ -67,9 +67,65 @@ python test_detector.py test_images/ai/0.jpg
 python test_detector.py test_images/real/0.jpg
 # Verdict: Human
 # Confidence: 100.0%
+
+# 5. (Optional) Run the full verification battery against all 6 images
+python verify_detector.py
+# Score: 6/6 (threshold: 5/6) — OK
 ```
 
 The first run downloads the SigLIP model weights (~400 MB) to `~/.cache/huggingface/`. Subsequent runs load from cache.
+
+### Verification harness
+
+`verify_detector.py` runs the detector against every image in `test_images/{ai,real}/` and asserts at least 5 of 6 are correctly classified (the Phase 1 acceptance bar). Exits non-zero on failure with a per-image table. Run it after any change that could affect inference (model swap, label-mapping edits, processor/transform changes).
+
+### Unit tests
+
+```bash
+python -m pytest tests/ -v
+```
+
+Covers the parts the verification harness doesn't:
+
+- **Error paths.** `detect("/does/not/exist.jpg")` raises `FileNotFoundError`; `detect("not_an_image.txt")` raises `ValueError`.
+- **Dict shape.** Return value has exactly `{verdict, confidence, summary}`; verdict ∈ {`AI-Generated`, `Human`}; confidence is a float in [0, 1]; summary matches the format the Phase 4 bot will post verbatim.
+- **Concurrency.** Five threads firing `detect()` simultaneously observe `max_concurrent == 1` — proves the `threading.Lock` in `detector.py` actually serializes calls (uses a monkeypatched slow stub to make the overlap window observable).
+- **Registry.** `DETECTOR_MODEL=bogus python -c "import detector"` exits non-zero with a `ValueError` mentioning the bad name — run as a subprocess so `sys.modules` caching doesn't hide the failure.
+
+Five tests, ~8 seconds (first run loads the SigLIP model once, then cached for the session).
+
+## Running the MCP server (Phase 3)
+
+The detector is also exposed as a callable MCP tool over HTTP. Two terminals:
+
+```bash
+# Terminal A — start the server
+python -m mcp_server.server
+# 2026-05-23 16:37:21 INFO mcp_server: Starting MCP server on http://127.0.0.1:8765/mcp
+# [SiglipDetector] Loading Ateeqq/ai-vs-human-image-detector on mps ...
+
+# Terminal B — round-trip a few images through the live server
+python test_mcp_client.py
+# Tools available: ['detect_ai_image']
+# --- AI image: ...    OK (99.9% confidence)
+# --- Real image: ...  OK (100.0% confidence)
+# --- Missing file: ...    OK (error correctly typed as FileNotFoundError)
+# --- Non-image file: ...  OK (error correctly typed as UnidentifiedImageError)
+# All round-trip cases passed.
+```
+
+The server uses MCP's streamable HTTP transport, mounted at `/mcp` on `127.0.0.1:8765`. **Loopback-only by design** — the `detect_ai_image` tool takes a local file path, so binding to anything but `127.0.0.1` would turn it into an arbitrary-file-read primitive. If the server ever needs to move off-host, switch the tool to accept image bytes.
+
+### Error envelope
+
+The MCP tool always returns a JSON-serialisable dict. On success it forwards the detector's `{verdict, confidence, summary}`. On failure it returns an error envelope tagged with the originating exception type so the Phase 4 bot can route to the right user-facing reply:
+
+```json
+{ "error": "FileNotFoundError: No such image: ...", "verdict": null, "confidence": null }
+{ "error": "UnidentifiedImageError: cannot identify image file ...", "verdict": null, "confidence": null }
+```
+
+The server never crashes on bad input — any unexpected exception is caught, logged with traceback, and returned as `{type_name}: {message}` so the bot stays alive.
 
 ### Device selection
 
@@ -89,8 +145,21 @@ fake_detector/
 ├── phases-telegram-ai-image-detector.md   # PRD: phase-by-phase build plan
 ├── implementation-plan.md                 # concrete decisions + per-phase steps
 ├── requirements.txt                       # Python dependencies (minor-version pinned)
+├── detectors/                             # Phase 2 — swappable detector backends
+│   ├── __init__.py                        #   re-exports get_detector, BaseDetector, DetectionResult
+│   ├── base.py                            #   ABC + DetectionResult dataclass
+│   ├── siglip.py                          #   current backend (Ateeqq SigLIP)
+│   └── registry.py                        #   name → class map, reads DETECTOR_MODEL
+├── detector.py                            # Phase 2 — public façade: eager singleton, lock-guarded
+├── mcp_server/                            # Phase 3 — MCP HTTP server
+│   ├── __init__.py
+│   └── server.py                          #   FastMCP, streamable-http, /mcp on 127.0.0.1:8765
 ├── download_test_images.py                # fetches 3 AI + 3 real test images
-├── test_detector.py                       # Phase 1 CLI: runs SigLIP on one image
+├── test_detector.py                       # Phase 1 CLI: runs the configured detector on one image
+├── verify_detector.py                     # Phase 1/2 harness: asserts ≥5/6 correct
+├── test_mcp_client.py                     # Phase 3 — round-trips images through the running server
+├── tests/                                 # Phase 2 — pytest suite (error paths, dict shape, concurrency, registry)
+│   └── test_detector.py
 └── test_images/
     ├── ai/                                # AI-generated verification images
     └── real/                              # real-photo verification images
@@ -99,13 +168,34 @@ fake_detector/
 Items planned for later phases (not yet present):
 
 ```
-detectors/        # Phase 2 — swappable backend (base.py, siglip.py, registry.py)
-detector.py       # Phase 2 — public façade
-mcp_server/       # Phase 3 — MCP HTTP server exposing detect_ai_image
-telegram_bot/     # Phase 4 — python-telegram-bot polling loop
-test_mcp_client.py# Phase 3 — round-trip test client
-.env.example      # Phase 4 — config template
+telegram_bot/      # Phase 4 — python-telegram-bot polling loop
+.env.example       # Phase 4 — config template
 ```
+
+### Using the detector from your own code
+
+`detector.py` is the stable public entry point:
+
+```python
+from detector import detect
+
+result = detect("path/to/image.jpg")
+# {"verdict": "AI-Generated", "confidence": 0.999, "summary": "..."}
+```
+
+Importing `detector` eagerly resolves `DETECTOR_MODEL` (default `"siglip"`)
+and loads the model. An unknown value raises `ValueError` immediately —
+misconfiguration surfaces at startup, not on the first inference call.
+Concurrent callers are serialized with a `threading.Lock` so two
+simultaneous photos can't double-allocate GPU memory.
+
+### Swapping the detector backend
+
+1. Drop a new module into `detectors/` whose class subclasses `BaseDetector`.
+2. Register it in `detectors/registry.py`: `_REGISTRY["myname"] = MyDetector`.
+3. Set `DETECTOR_MODEL=myname` in your environment.
+
+No other code changes.
 
 ## Verification dataset
 
@@ -152,7 +242,8 @@ Highlights:
 Each phase is independently completable and testable. Acceptance criteria for each are spelled out in [phases-telegram-ai-image-detector.md](phases-telegram-ai-image-detector.md).
 
 - [x] **Phase 1** — Local CLI inference, 6/6 on verification battery
-- [ ] **Phase 2** — `detectors/` package + `detector.py` façade with eager-validated singleton
+- [x] **Phase 2** — `detectors/` package + `detector.py` façade with eager-validated singleton
+- [x] **Phase 3** — MCP server (streamable HTTP, loopback-only) exposing `detect_ai_image`
 - [ ] **Phase 3** — MCP server exposing `detect_ai_image` over HTTP
 - [ ] **Phase 4** — Telegram bot (polling), first end-to-end working version
 - [ ] **Phase 5** — Health checks, timeouts, structured logging, requirements lock file
@@ -162,11 +253,11 @@ Each phase is independently completable and testable. Acceptance criteria for ea
 
 This is currently a personal project; the design docs ([PRD](phases-telegram-ai-image-detector.md), [implementation plan](implementation-plan.md)) are the source of truth for what's intended. PRs and issues welcome once Phase 4 lands and the project is actually useful end-to-end.
 
-If you want to swap in a different detection model, the right move is to wait until Phase 2 is done — then it's a single file (`detectors/yourmodel.py`) plus a registry entry.
+If you want to swap in a different detection model, the path is now in place: add a single file (`detectors/yourmodel.py`) plus a registry entry — see [Swapping the detector backend](#swapping-the-detector-backend).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+AGPL-3.0. See [LICENSE](LICENSE). Because this is intended to run as a network-accessible bot, AGPL is the right copyleft — anyone running a modified version as a service must offer the modified source to users interacting with it over the network.
 
 ## Credits
 
