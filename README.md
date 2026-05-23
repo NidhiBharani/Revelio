@@ -4,14 +4,14 @@ A Telegram bot that detects AI-generated images posted in group chats and replie
 
 ## Status
 
-**Phase 3 of 6 complete** — local model inference is working, the detector backend is swappable, and the detector is now exposed over an MCP HTTP server. The Telegram bot and hardening phases are not implemented yet. See [Roadmap](#roadmap).
+**Phase 4 of 6 complete** — the end-to-end MVP is built. Code-level acceptance (error matrix, temp-file cleanup, logging) is verified by automated tests; live in-group testing requires a BotFather token and a test group (see [Running the Telegram bot](#running-the-telegram-bot-phase-4)). The hardening pass and webhook mode are not done yet. See [Roadmap](#roadmap).
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | Local model inference (CLI) | Done |
 | 2 | Detector module (swappable backend) | Done |
 | 3 | MCP server (HTTP transport) | Done |
-| 4 | Telegram bot (polling) — first end-to-end MVP | Not started |
+| 4 | Telegram bot (polling) — first end-to-end MVP | Done (code), live test pending |
 | 5 | Hardening + README polish | Not started |
 | 6 | Webhook mode (deferred until deployed) | Not started |
 
@@ -127,6 +127,71 @@ The MCP tool always returns a JSON-serialisable dict. On success it forwards the
 
 The server never crashes on bad input — any unexpected exception is caught, logged with traceback, and returned as `{type_name}: {message}` so the bot stays alive.
 
+## Running the Telegram bot (Phase 4)
+
+End-to-end the MVP needs three things up at the same time: the MCP server, the bot, and a real Telegram chat.
+
+> For a fully detailed walkthrough (with verification steps at each stage and a troubleshooting table), see **[TELEGRAM_SETUP.md](TELEGRAM_SETUP.md)**. The summary below assumes you already know your way around BotFather.
+
+### One-time setup
+
+1. **Create the bot.** DM [@BotFather](https://t.me/BotFather) on Telegram, send `/newbot`, follow the prompts, save the token.
+2. **Disable privacy mode.** Still in BotFather: `/setprivacy` → pick your bot → **Disable**. Without this, the bot only sees messages that start with `/` and will never see group photos.
+3. **Add the bot to your test group** as a regular member.
+4. **Configure `.env`.** Copy `.env.example` to `.env` and paste the token:
+   ```bash
+   cp .env.example .env
+   # edit .env, replace your_token_here
+   ```
+
+### Run
+
+Three terminals:
+
+```bash
+# Terminal A — MCP server
+python -m mcp_server.server
+
+# Terminal B — Telegram bot
+python -m telegram_bot.bot
+# 2026-05-23 16:42:01 INFO telegram_bot: Bot starting (polling mode). MCP at http://127.0.0.1:8765/mcp
+
+# Terminal C — your Telegram client (phone or desktop)
+# Post a photo in the test group. Within a few seconds the bot replies
+# as a threaded reply to the original photo message:
+#   🔍 AI Image Check
+#   Verdict: AI-Generated
+#   Confidence: 99.9%
+```
+
+### Error matrix
+
+What the bot does when things go wrong (also encoded in `tests/test_bot.py`):
+
+| Situation | Detection | User-facing reply |
+|---|---|---|
+| Success | MCP returns `verdict` + `summary` | Replies in thread with the summary |
+| Unsupported format | MCP `error` contains `UnidentifiedImageError` | `⚠️ Unsupported image format.` |
+| Generic inference failure | MCP `error` is anything else | `⚠️ Could not analyse this image.` |
+| MCP server unreachable | `call_mcp_detect` raises | **Silent** (log only — avoids spamming the group when the server is down) |
+| Photo download failed | Telegram API exception before MCP call | **Silent** (log only) |
+| Non-photo message | `filters.PHOTO` filters it out | Ignored |
+
+Temp files in `/tmp/tmp*.jpg` are unlinked in `finally` — verified by `test_handle_photo_cleans_up_temp_file`, which forces an MCP failure mid-call and asserts the file is gone.
+
+### What's automated vs. manual
+
+Tests in `tests/test_bot.py` cover:
+- Error-matrix routing (`route_mcp_error` with 5 parametrised inputs)
+- MCP wrapper against the live server (skipped if server is down)
+- `handle_photo` end-to-end with a mocked Telegram update and mocked MCP — success, both error branches, MCP-down, download-fail, non-photo, temp-file cleanup
+
+Not automated (requires real Telegram):
+- The 5-second SLA from "post photo → bot reply"
+- Privacy-mode-disabled side of BotFather config
+- Multiple group members posting photos
+- 30-min uptime soak (deferred to Phase 5)
+
 ### Device selection
 
 `test_detector.py` automatically picks the best available device in this order:
@@ -154,12 +219,17 @@ fake_detector/
 ├── mcp_server/                            # Phase 3 — MCP HTTP server
 │   ├── __init__.py
 │   └── server.py                          #   FastMCP, streamable-http, /mcp on 127.0.0.1:8765
+├── telegram_bot/                          # Phase 4 — Telegram bot
+│   ├── __init__.py
+│   └── bot.py                             #   polling, MCP client, error matrix, temp-file cleanup
+├── .env.example                           # Phase 4 — copy to .env and fill in your bot token
 ├── download_test_images.py                # fetches 3 AI + 3 real test images
 ├── test_detector.py                       # Phase 1 CLI: runs the configured detector on one image
 ├── verify_detector.py                     # Phase 1/2 harness: asserts ≥5/6 correct
 ├── test_mcp_client.py                     # Phase 3 — round-trips images through the running server
-├── tests/                                 # Phase 2 — pytest suite (error paths, dict shape, concurrency, registry)
-│   └── test_detector.py
+├── tests/                                 # pytest suite
+│   ├── test_detector.py                   #   Phase 2 — error paths, dict shape, concurrency, registry
+│   └── test_bot.py                        #   Phase 4 — error matrix, MCP client wrapper, temp-file lifecycle
 └── test_images/
     ├── ai/                                # AI-generated verification images
     └── real/                              # real-photo verification images
@@ -168,8 +238,7 @@ fake_detector/
 Items planned for later phases (not yet present):
 
 ```
-telegram_bot/      # Phase 4 — python-telegram-bot polling loop
-.env.example       # Phase 4 — config template
+requirements.lock  # Phase 5 — pinned via `pip freeze`
 ```
 
 ### Using the detector from your own code
@@ -244,6 +313,7 @@ Each phase is independently completable and testable. Acceptance criteria for ea
 - [x] **Phase 1** — Local CLI inference, 6/6 on verification battery
 - [x] **Phase 2** — `detectors/` package + `detector.py` façade with eager-validated singleton
 - [x] **Phase 3** — MCP server (streamable HTTP, loopback-only) exposing `detect_ai_image`
+- [x] **Phase 4** — Telegram bot (polling): error matrix, temp-file cleanup, logging — 14 automated tests pass; live in-group test pending BotFather setup
 - [ ] **Phase 3** — MCP server exposing `detect_ai_image` over HTTP
 - [ ] **Phase 4** — Telegram bot (polling), first end-to-end working version
 - [ ] **Phase 5** — Health checks, timeouts, structured logging, requirements lock file
