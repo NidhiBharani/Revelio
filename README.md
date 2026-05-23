@@ -1,4 +1,4 @@
-# fake_detector
+# Revelio
 
 A Telegram bot that detects AI-generated images posted in group chats and replies with a verdict and confidence score. Built on the [`Ateeqq/ai-vs-human-image-detector`](https://huggingface.co/Ateeqq/ai-vs-human-image-detector) SigLIP model, served through an MCP server so the detector backend can be swapped without touching the bot.
 
